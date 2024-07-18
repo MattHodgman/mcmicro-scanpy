@@ -11,11 +11,11 @@ Parse arguments.
 Input file is required.
 '''
 def parseArgs():
-    parser = argparse.ArgumentParser(description='Cluster cell types using mcmicro marker expression data.')
-    parser.add_argument('-i', '--input', help="Input CSV of mcmicro marker expression data for cells", type=str, required=True)
+    parser = argparse.ArgumentParser(description='Cluster cell types using latent vectors of pixel image patches.')
+    parser.add_argument('-i', '--input', help="Input CSV of latent vector data for cells", type=str, required=True)
     parser.add_argument('-o', '--output', help='The directory to which output files will be saved', type=str, required=False)
-    parser.add_argument('-m', '--markers', help='A text file with a marker on each line to specify which markers to use for clustering', type=str, required=False)
     parser.add_argument('-k', '--neighbors', help='the number of nearest neighbors to use when clustering. The default is 30.', default=30, type=int, required=False)
+    parser.add_argument('-r', '--resolution', help='the resolution controls the coarseness of the clustering. Higher values lead to more clusters. The default is 1.0.', default=1.0, type=float, required=False)
     parser.add_argument('-c', '--method', help='Include a column with the method name in the output files.', action="store_true", required=False)
     parser.add_argument('-y', '--config', help='A yaml config file that states whether the input data should be log/logicle transformed.', type=str, required=False)
     parser.add_argument('--force-transform', help='Log transform the input data. If omitted, and --no-transform is omitted, log transform is only performed if the max value in the input data is >1000.', action='store_true', required=False)
@@ -32,95 +32,25 @@ def getDataName(path):
     dataName = fileName[:fileName.rfind('.')] # get data name by removing extension from file name
     return dataName
 
-
 '''
-Get markers to use for clustering from a text file where each marker is on a line and corresponds exactly to the column name in the input data file.
-Returns a list of markers to use for clustering.
+Write PATCHES_FILE from leidenCluster() adata
 '''
-def get_markers(markers_file):
-    markers = [] # list of markers in file
-
-    # read markers from file
-    f = open(markers_file, 'r')
-    for line in f:
-        markers.append(line.strip())
-
-    return markers
-
-
-'''
-Clean data in input file.
-NOTE: Currently we are doing this with pandas however, using csv might be faster, or numpy.
-
-Exclude the following data from clustering:
-    - X_centroid, …, Extent, Orientation - morphological features
-    - Any of the following DNA stains
-        - DNA0, DNA1, DNA2, …
-        - Hoechst0, Hoechst1, ....
-        - DAPI0, DAPI1, …
-    - AF* (e.g., AF488, AF555, etc.) - autofluorescence
-    - A* (e.g., A488, A555, etc.) - secondary antibody staining only
-
-To include any of these markers in the clustering, provide their exact names in a file passed in with the '-m' flag
-'''
-def clean(input_file):
-
-    # constants
-
-    # a default list of features to exclude from clustering
-    FEATURES_TO_REMOVE = ['X_centroid', 'Y_centroid', # morphological features
-                        'column_centroid', 'row_centroid', 
-                        'Area', 'MajorAxisLength', 
-                        'MinorAxisLength', 'Eccentricity', 
-                        'Solidity', 'Extent', 'Orientation', 
-                        'DNA.*', 'Hoechst.*', 'DAP.*', # DNA stain
-                        'AF.*', # autofluorescence
-                        'A\d{3}.*'] # secondary antibody staining only (iy has to have 3 digist after)
-
-    # load csv
-    data = pd.read_csv(input_file)
-
-    # if markers provided, keep only those features and the Cell IDs. It is important that the CellID column is first.
-    if args.markers:
-        if CELL_ID not in markers: # add cell ID to list of columns to keep
-            markers.insert(0, CELL_ID)
-        elif markers.index(CELL_ID) != 0: # if cell ID column is included but not first, move it to the front
-            markers.insert(0, markers.pop(markers.index(CELL_ID)))
-        data = data[markers]
-    else:
-        # find any columns in the input csv that should be excluded from clustering be default
-        # NOTE: may want to replace this with regex, it might be faster.
-        col_to_remove = []
-        cols = data.columns
-        for feature in FEATURES_TO_REMOVE:
-            r = re.compile(feature)
-            col_to_remove.extend(list(filter(r.match, cols)))
-        
-        # drop all columns that should be excluded
-        data = data.drop(columns=col_to_remove, axis=1)
-
-    # save cleaned data to csv
-    data.to_csv(f'{output}/{clean_data_file}', index=False)
-
-
-'''
-Write CELLS_FILE from leidenCluster() adata
-'''
-def writeCells(adata):
-    cells = pd.DataFrame(adata.obs[CELL_ID].astype(int)) # extract cell IDs to dataframe
-    cells[CLUSTER] = adata.obs[LEIDEN] # extract and add cluster assignments to cells dataframe
+def writePatches(adata):
+    print("Writing Patches...")
+    patches = pd.DataFrame(adata.obs[PATCH_ID].astype(int)) # extract patch IDs to dataframe
+    patches[CLUSTER] = adata.obs[LEIDEN] # extract and add cluster assignments to patches dataframe
 
     # add in method column if requested
     if args.method:
-        cells[METHOD] = SCANPY
+        patches[METHOD] = SCANPY
 
-    cells.to_csv(f'{output}/{cells_file}', index=False)
-
+    patches.to_csv(f'{output}/{patches_file}', index=False)
 
 '''
 Write CLUSTERS_FILE from leidenCluster() adata
 '''
 def writeClusters(adata):
+    print("Writing Clusters...")
     clusters = pd.DataFrame(columns=adata.var_names, index=adata.obs[LEIDEN].cat.categories)   
     clusters.index.name = CLUSTER # name indices as cluster column
     for cluster in adata.obs.leiden.cat.categories: # this assumes that LEIDEN = 'leiden' if the name is changed, replace it for 'leiden' in this line
@@ -132,28 +62,37 @@ def writeClusters(adata):
 
     clusters.to_csv(f'{output}/{clusters_file}')
 
-
 '''
 Get max value in dataframe.
 '''
 def getMax(df):
     return max([n for n in df.max(axis = 0)])
 
-
-
 '''
 Cluster data using the Leiden algorithm via scanpy
 '''
-def leidenCluster():
+
+def leidenCluster(input_file):
+    print("Starting leidenCluster()...")
+
+    data = pd.read_csv(input_file)
+    columns = list(data.columns)
+    if columns.index(PATCH_ID) != 0: # if patch ID column is included but not first, move it to the front
+        columns.insert(0, columns.pop(columns.index(PATCH_ID)))
+    data = data[columns]
+    # save cleaned data to csv
+    data.to_csv(f'{output}/{clean_data_file}', index=False)
 
     sc.settings.verbosity = 3 # print out information
-    adata_init = sc.read(f'{output}/{clean_data_file}', cache=True) # load in clean data
+    print(f'{output}/{clean_data_file}')
+    adata_init = sc.read(f'{output}/{clean_data_file}', cache=True) # load input data
 
-    # move CellID info into .obs
-    # this assumes that 'CELL_ID' is the first column in the csv
-    adata_init.obs[CELL_ID] = adata_init.X[:,0]
-    adata = ad.AnnData(np.delete(adata_init.X, 0, 1), obs=adata_init.obs, var=adata_init.var.drop([CELL_ID]))
-
+    # move PATCH_ID info into .obs
+    # this assumes that 'PATCH_ID' is the first column in the csv
+    adata_init.obs[PATCH_ID] = adata_init.X[:,0]
+    adata = ad.AnnData(np.delete(adata_init.X, 0, 1), obs=adata_init.obs, var=adata_init.var.drop([PATCH_ID]))
+    
+    print("Started writing config")
     # log transform the data according to parameter. If 'auto,' transform only if the max value >1000. Don't do anything if transform == 'false'. Write transform decision to yaml file.
     if transform == 'true':
         sc.pp.log1p(adata, base=10)
@@ -163,30 +102,32 @@ def leidenCluster():
         writeConfig(True)
     else:
         writeConfig(False)
-
+    print("Finished writing config")
+    
     # compute neighbors and cluster
-    sc.pp.neighbors(adata, n_neighbors=args.neighbors, n_pcs=10) # compute neighbors, using the first 10 principle components and the number of neighbors provided in the command line. Default is 30.
-    sc.tl.leiden(adata, key_added = LEIDEN, resolution=1.0) # run leidan clustering. default resolution is 1.0
-
-    # write cell/cluster information to 'CELLS_FILE'
-    writeCells(adata)
+    sc.pp.neighbors(adata, n_neighbors=args.neighbors, n_pcs=50, use_rep='X') # compute neighbors, using the first 10 principle components and the number of neighbors provided in the command line. Default is 30.
+    sc.tl.leiden(adata, key_added = LEIDEN, resolution=args.resolution) # run leidan clustering. default resolution is 1.0
+    print("Finished leiden clustering")
+    
+    # write patch/cluster information to 'PATCHES_FILE'
+    writePatches(adata)
 
     # write cluster mean feature expression to 'CLUSTERS_FILE'
     writeClusters(adata)
-
 
 '''
 Write to a yaml file whether the data was transformed or not.
 '''
 def writeConfig(transformed):
-    os.mkdir('qc')
+    qcExists = os.path.exists('qc')
+    if not qcExists: 
+        os.mkdir('qc')
     with open('qc/config.yml', 'a') as f:
         f.write('---\n')
         if transformed:
             f.write('transform: true')
         else:
             f.write('transform: false')
-
 
 '''
 Read config.yml file contents.
@@ -202,7 +143,6 @@ def readConfig(file):
 
     return transform
 
-
 '''
 Main.
 '''
@@ -217,10 +157,6 @@ if __name__ == '__main__':
     else:
         output = args.output
 
-    # get list of markers if provided
-    if args.markers is not None:
-        markers = get_markers(args.markers)
-
     # assess log transform parameter
     if args.force_transform and not args.no_transform:
         transform = 'true'
@@ -232,7 +168,7 @@ if __name__ == '__main__':
         transform = 'auto'
 
     # constants
-    CELL_ID = 'CellID' # column name holding cell IDs
+    PATCH_ID = 'CellID' # column name holding patch IDs
     CLUSTER = 'Cluster' # column name holding cluster number
     LEIDEN = 'leiden' # obs name for cluster assignment
     METHOD = 'Method' # name of column containing the method for clustering
@@ -241,11 +177,11 @@ if __name__ == '__main__':
     # output file names
     data_prefix = getDataName(args.input) # get the name of the input data file to add as a prefix to the output file names
     clean_data_file = f'{data_prefix}-clean.csv' # name of output cleaned data CSV file
-    clusters_file = f'{data_prefix}-clusters.csv' # name of output CSV file that contains the mean expression of each feaute, for each cluster
-    cells_file = f'{data_prefix}-cells.csv' # name of output CSV file that contains each cell ID and it's cluster assignation
+    clusters_file = f'{data_prefix}-clusters.csv' # name of output CSV file that contains the mean expression of each latent vector, for each cluster
+    patches_file = f'{data_prefix}-patches.csv' # name of output CSV file that contains each patch ID and it's assigned cluster
     
-    # clean input data file
-    clean(args.input)
+
+    print("Entering Leiden function...")
 
     # cluster using scanpy implementation of Leiden algorithm
-    leidenCluster()
+    leidenCluster(args.input)
